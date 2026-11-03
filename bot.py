@@ -16,6 +16,7 @@ if sys.stdout.encoding != 'utf-8':
         pass
 
 import discord
+from aiohttp import web
 from discord.ext import commands
 from dotenv import load_dotenv
 from google import genai
@@ -100,7 +101,7 @@ else:
     logger.warning("GEMINI_API_KEY 未設定，請在 .env 中填寫有效的金鑰！")
 
 # ---------------------------------------------------------------------------
-# 輔助函式：即時情報、成員查找與動作執行
+# 輔助函式：即時情報、動作執行
 # ---------------------------------------------------------------------------
 def get_server_context(message: discord.Message) -> str:
     guild = message.guild
@@ -151,11 +152,9 @@ async def process_voice_actions(reply_text: str, message: discord.Message, raw_p
     target_mentions = [m for m in message.mentions if m.id != bot.user.id]
 
     # 【絕對安全防線】：只有在訊息中有實際 @TAG 目標時，才允許執行語音操作！
-    # 沒 TAG 人就只是普通聊天，絕不執行任何踢人或靜音動作
     if not target_mentions:
         return cleaned_reply
 
-    # 判斷動作類型（由 AI 標籤或關鍵字 Fallback 決定）
     actions_to_execute = []
     if matches:
         for act_type, _, param in matches:
@@ -172,7 +171,6 @@ async def process_voice_actions(reply_text: str, message: discord.Message, raw_p
 
     feedback_notes = []
 
-    # 針對實際被 @TAG 的成員執行動作
     for act, is_enable in actions_to_execute:
         for member in target_mentions:
             if not member.voice or not member.voice.channel:
@@ -251,10 +249,10 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
+    # 1. 嚴格檢查：只有在私訊 (DM) 或是真正被 @mention 時才可能處理
     is_dm = isinstance(message.channel, discord.DMChannel)
     is_mentioned = bot.user in message.mentions
 
-    # 1. 嚴格檢查：只有在私訊 (DM) 或是真正被 @mention 時才可能處理
     if not (is_dm or is_mentioned):
         return
 
@@ -262,7 +260,7 @@ async def on_message(message: discord.Message):
     if not is_dm and ALLOWED_CHANNEL_ID and message.channel.id != ALLOWED_CHANNEL_ID:
         return
 
-    # 清除對機器人的 @mention 前綴（保留可能 @其他目標 的標籤給意圖判斷）
+    # 清除對機器人的 @mention 前綴
     clean = message.content
     if bot.user:
         clean = re.sub(rf"<@!?{bot.user.id}>", "", clean).strip()
@@ -279,7 +277,7 @@ async def on_message(message: discord.Message):
     # 記憶庫只存乾淨的對話文字
     memory_manager.add_message(cid, role="user", text=clean)
 
-    # 判斷是否需要注入語音房情報（只有當使用者在問語音房，或者有 @其他人 時才注入，避免誘發 AI 踢人）
+    # 判斷是否需要注入語音房情報
     other_mentions = [m for m in message.mentions if m.id != bot.user.id]
     needs_voice_info = bool(other_mentions or any(k in clean for k in ["語音", "語音房", "踢", "靜音", "拒聽", "誰在"]))
 
@@ -313,13 +311,43 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
+# ---------------------------------------------------------------------------
+# Render Web Service Health Check HTTP 伺服器
+# ---------------------------------------------------------------------------
+async def handle_ping(request: web.Request) -> web.Response:
+    """Render 健康檢查路由，回傳 200 OK 避免容器重啟"""
+    return web.Response(text="SharkBot is swimming and alive! 🦈 Status: OK\n", status=200)
 
-def main():
+
+async def start_web_server():
+    """在 Render 指派的 PORT 上啟動輕量 aiohttp Web 伺服器"""
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    app.router.add_get("/healthz", handle_ping)
+
+    port = int(os.getenv("PORT", 8080))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Render Health Check HTTP Server 已在 Port {port} 啟動！")
+    print(f"Render Health Check HTTP Server 已在 Port {port} 啟動！")
+
+
+# ---------------------------------------------------------------------------
+# 啟動進入點（非同步並發 Web Server 與 Discord Bot）
+# ---------------------------------------------------------------------------
+async def main():
     if not DISCORD_BOT_TOKEN or DISCORD_BOT_TOKEN.startswith("你的_"):
         print("[警告] DISCORD_BOT_TOKEN 尚未在 .env 配置！")
         sys.exit(1)
+
+    # 1. 啟動 Web 伺服器供 Render Health Check
+    await start_web_server()
+
+    # 2. 啟動 Discord 機器人
     try:
-        bot.run(DISCORD_BOT_TOKEN)
+        await bot.start(DISCORD_BOT_TOKEN)
     except discord.errors.LoginFailure:
         print("[錯誤] Discord Token 無效，請檢查 .env！")
         sys.exit(1)
@@ -329,4 +357,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
