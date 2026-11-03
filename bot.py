@@ -71,6 +71,7 @@ SYSTEM_PROMPT = """你是一隻名叫「鯊逼」的呆萌小鯊魚吉祥物，�
 
 規則要求：
 - 無論是誰叫你咬人/踢人/靜音，都必須輸出 [[ACTION:...]] 動作標籤！不要只用嘴巴說而不帶標籤！
+- 如果對方說「踢掉他們/全踢了」，請為語音房內的「其他人」分別輸出多個 [[ACTION:KICK, 名字]] 標籤（不要踢下達命令的說話者本人）！
 - 目標名稱請填寫人類所說的名字或 Mention 的對象名稱。
 
 範例情境：
@@ -101,7 +102,7 @@ def get_server_context(message: discord.Message) -> str:
     lines = [
         "【當前 Discord 伺服器即時情報】",
         f"- 伺服器名稱：{guild.name}",
-        f"- 正在跟你說話的人類：{author_name}",
+        f"- 正在跟你說話的人類（下達命令者）：{author_name}",
     ]
 
     voice_channels = guild.voice_channels
@@ -132,9 +133,7 @@ def find_target_member(guild: discord.Guild, target_name: str, message: discord.
                 return m
         return non_bot_mentions[0]
 
-    # 純化搜尋關鍵字
     target_clean = target_name.strip().lstrip("@").lower()
-    # 移除純數字或標籤中的 ID 格式
     target_clean = re.sub(r"[<@!>]", "", target_clean)
 
     # 取得當前在語音房裡的所有成員（扣除下令者自己）
@@ -177,7 +176,7 @@ def find_target_member(guild: discord.Guild, target_name: str, message: discord.
     return None
 
 
-def detect_fallback_action(cleaned_content: str, message: discord.Message) -> Optional[Tuple[str, str, bool]]:
+def detect_fallback_action(cleaned_content: str, message: discord.Message) -> Optional[List[Tuple[str, str, bool]]]:
     """若 AI 忘記加標籤，由程式碼自動根據使用者輸入識別語音意圖 (Fallback)"""
     content_lower = cleaned_content.lower()
 
@@ -202,18 +201,29 @@ def detect_fallback_action(cleaned_content: str, message: discord.Message) -> Op
     if not action_type:
         return None
 
+    # 如果要求踢掉所有人 / 他們 / 兩個
+    if any(k in content_lower for k in ["他們", "大家", "所有人", "全部", "倆個", "兩個"]):
+        guild = message.guild
+        if guild:
+            results = []
+            for vc in guild.voice_channels:
+                for m in vc.members:
+                    if m.id != message.author.id and m.id != bot.user.id:
+                        results.append((action_type, m.display_name, is_enable))
+            if results:
+                return results
+
     # 提取目標名稱（優先檢查 mention）
     non_bot_mentions = [m for m in message.mentions if m.id != bot.user.id]
     target_name = non_bot_mentions[0].display_name if non_bot_mentions else ""
 
-    # 若無 mention，從字串中剔除動詞作為目標
     if not target_name:
         temp = content_lower
         for word in ["把", "讓", "叫", "踢出", "踢掉", "踢他", "踢走", "拍飛", "踢", "靜音", "閉嘴", "封嘴", "解靜音", "解除靜音", "拒聽", "解拒聽", "說話", "開麥", "他", "了"]:
             temp = temp.replace(word, " ")
         target_name = temp.strip()
 
-    return action_type, target_name, is_enable
+    return [(action_type, target_name, is_enable)]
 
 
 async def process_voice_actions(reply_text: str, message: discord.Message, raw_user_prompt: str) -> str:
@@ -229,8 +239,7 @@ async def process_voice_actions(reply_text: str, message: discord.Message, raw_u
     if not matches:
         fallback = detect_fallback_action(raw_user_prompt, message)
         if fallback:
-            act, tgt, en = fallback
-            matches = [(act, tgt, str(en))]
+            matches = [(act, tgt, str(en)) for act, tgt, en in fallback]
             logger.info(f"程式成功 Fallback 攔截語音意圖: {matches}")
 
     if not matches:
@@ -249,6 +258,11 @@ async def process_voice_actions(reply_text: str, message: discord.Message, raw_u
         if not member:
             logger.warning(f"找不到目標成員: {target_name}")
             feedback_notes.append(f"*(⚠️ 咬空了：本鯊在伺服器裡找不到「{target_name}」這個人捏！建議直接 @ 他喔！)*")
+            continue
+
+        # 防自爆保護：除非指令中明確說要踢自己，否則排除發言者本人
+        if member.id == message.author.id and not any(k in raw_user_prompt.lower() for k in ["自己", "我也", "我自"]):
+            logger.info(f"略過發令者本人 {member.display_name}，避免誤傷自爆")
             continue
 
         if not member.voice or not member.voice.channel:
@@ -383,12 +397,24 @@ async def on_message(message: discord.Message):
     is_dm = isinstance(message.channel, discord.DMChannel)
     is_mentioned = bot.user in message.mentions
 
-    if not (is_dm or is_mentioned):
+    # 防手滑機制：檢查是否手打機器人名稱（即使沒觸發 Discord 彈出 mention 也能觸發）
+    bot_names = ["鯊逼", "鯊鯊", "小鯊魚", "@鯊逼"]
+    has_bot_name = any(name in message.content for name in bot_names)
+
+    # 檢查是否為「回覆 (Reply)」機器人的訊息
+    is_reply_to_bot = False
+    if message.reference and message.reference.resolved:
+        if isinstance(message.reference.resolved, discord.Message) and message.reference.resolved.author.id == bot.user.id:
+            is_reply_to_bot = True
+
+    if not (is_dm or is_mentioned or has_bot_name or is_reply_to_bot):
         return
 
+    # 清理 Mention 標籤與開頭的機器人名字
     cleaned_content = message.content
     if bot.user:
-        cleaned_content = re.sub(rf"<@!?{bot.user.id}>", "", cleaned_content).strip()
+        cleaned_content = re.sub(rf"<@!?{bot.user.id}>", "", cleaned_content)
+    cleaned_content = re.sub(r"@?鯊逼|@?鯊鯊|小鯊魚", "", cleaned_content, count=1).strip()
 
     if not cleaned_content:
         cleaned_content = "（戳了戳鯊鯊）"
