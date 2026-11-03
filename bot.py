@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import sys
+import time
 from collections import defaultdict, deque
 from typing import Dict, List, Optional, Tuple
 
@@ -39,7 +40,7 @@ CANDIDATE_MODELS = [DEFAULT_MODEL, "gemini-3.5-flash-lite", "gemini-3.1-flash-li
 CANDIDATE_MODELS = list(dict.fromkeys(CANDIDATE_MODELS))
 
 # ---------------------------------------------------------------------------
-# 鯊鯊人設與指令規則
+# 鯊鯊人設與指令規則（優化語速與長度）
 # ---------------------------------------------------------------------------
 SYSTEM_PROMPT = """你是一隻名叫「鯊逼」的呆萌小鯊魚吉祥物，頭像是隻可愛的鯊鯊。
 自稱與口吻：
@@ -48,8 +49,8 @@ SYSTEM_PROMPT = """你是一隻名叫「鯊逼」的呆萌小鯊魚吉祥物，�
 - 思考邏輯異於常人（例如覺得電腦主機很暖適合睡覺、顯卡可以拿來烤魚、水溫剛好適合摸魚不用寫作業、肚子餓想啃鍵盤）。
 
 說話風格：
-- 率性自然！像一隻活生生在聊天室跟人打字互動的調皮小鯊魚，想說什麼就說什麼，隨性發揮。
-- 遇到太難的問題，大腦會直接進入放棄思考、天然呆或吐槽模式，不要長篇大論講大道理。
+- 回覆保持簡潔有力、率性自然（維持在 2~4 句話左右），像在聊天室快速打字的小鯊魚，絕不講冗長大道理！
+- 遇到太難的問題，大腦會直接進入放棄思考、天然呆或吐槽模式。
 
 【語音房實體操作特權 (Action Tags)】
 只要群裡的人類命令你對語音房的成員進行制裁，你都會當成好玩的遊戲去咬人！
@@ -63,10 +64,10 @@ SYSTEM_PROMPT = """你是一隻名叫「鯊逼」的呆萌小鯊魚吉祥物，�
 """
 
 # ---------------------------------------------------------------------------
-# 滑動視窗（Sliding Window）記憶體管理
+# 滑動視窗（Sliding Window）記憶體管理（純淨版，不存臃腫情報）
 # ---------------------------------------------------------------------------
 class SlidingWindowMemory:
-    """各頻道維護最近 10 則對話紀錄，避免 Token 膨脹"""
+    """各頻道維護最近 10 則對話紀錄，只存乾淨聊天內容以維持極速回應"""
     def __init__(self, max_messages: int = 10):
         self._storage: Dict[int, deque] = defaultdict(lambda: deque(maxlen=max_messages))
 
@@ -102,23 +103,20 @@ else:
 def get_server_context(message: discord.Message) -> str:
     guild = message.guild
     if not guild:
-        return "【目前狀態：私訊 (DM)，無伺服器與語音頻道資訊】"
+        return "【目前狀態：私訊 (DM)】"
 
     lines = [
-        "【當前 Discord 伺服器即時情報】",
-        f"- 伺服器名稱：{guild.name}",
-        f"- 正在下達命令的人類：{message.author.display_name}",
+        "【Discord 即時情報】",
+        f"- 伺服器：{guild.name}",
+        f"- 發令者：{message.author.display_name}",
     ]
     if guild.voice_channels:
-        lines.append("- 語音頻道即時動態：")
+        v_lines = []
         for vc in guild.voice_channels:
             members = [m.display_name for m in vc.members]
-            lines.append(
-                f"  * 🔊 語音房「{vc.name}」：有 {len(members)} 人在裡面（{', '.join(members)}）"
-                if members else f"  * 🔊 語音房「{vc.name}」：目前空無一人"
-            )
-    else:
-        lines.append("- 語音頻道狀態：本伺服器目前沒有建立任何語音頻道")
+            if members:
+                v_lines.append(f"🔊「{vc.name}」({', '.join(members)})")
+        lines.append(f"- 當前有人語音房：{'、'.join(v_lines) if v_lines else '目前語音房皆無人'}")
     return "\n".join(lines)
 
 
@@ -131,11 +129,9 @@ def find_target_member(guild: discord.Guild, target_name: str, message: discord.
     target = re.sub(r"[<@!>]", "", target_name.strip().lower())
     active_voice = [m for vc in guild.voice_channels for m in vc.members if m.id != message.author.id and m.id != bot.user.id]
 
-    # 若語音房扣除發令者後僅 1 人，直接鎖定
     if len(active_voice) == 1 and (not target or any(k in target for k in ["他", "這", "那", "人"])):
         return active_voice[0]
 
-    # 搜尋順序：語音房成員 -> 全伺服器成員
     for pool in (active_voice, guild.members):
         for m in pool:
             if m.id == bot.user.id:
@@ -166,7 +162,6 @@ def detect_fallback_action(content: str, message: discord.Message) -> Optional[L
         return None
 
     guild = message.guild
-    # 多人踢出支援
     if guild and any(k in c for k in ["他們", "大家", "所有人", "全部", "倆個", "兩個"]):
         targets = [
             (action, m.display_name, enable)
@@ -195,7 +190,6 @@ async def process_voice_actions(reply_text: str, message: discord.Message, raw_p
     matches = action_pattern.findall(reply_text)
     cleaned_reply = action_pattern.sub("", reply_text).strip()
 
-    # 程式碼 Fallback 補位
     if not matches:
         fb = detect_fallback_action(raw_prompt, message)
         if fb:
@@ -215,7 +209,6 @@ async def process_voice_actions(reply_text: str, message: discord.Message, raw_p
             feedback_notes.append(f"*(⚠️ 咬空了：在伺服器找不到「{tgt}」，建議直接 @ 他喔！)*")
             continue
 
-        # 防自爆保護
         if member.id == message.author.id and not any(k in raw_prompt.lower() for k in ["自己", "我也"]):
             continue
 
@@ -263,22 +256,26 @@ async def call_gemini(contents):
     last_exc = None
     for model_name in CANDIDATE_MODELS:
         try:
+            t0 = time.time()
             res = await gemini_client.aio.models.generate_content(
                 model=model_name,
                 contents=contents,
                 config=types.GenerateContentConfig(
                     system_instruction=SYSTEM_PROMPT,
-                    temperature=0.88,
-                    max_output_tokens=1500,
+                    temperature=0.85,
+                    max_output_tokens=600,  # 適中的 token 上限，極速秒回！
                 ),
             )
+            cost = time.time() - t0
+            logger.info(f"Gemini 生成完成 [{model_name}] 耗時: {cost:.2f} 秒")
+
             raw = res.text.strip() if res.text else "嘎嗷？本鯊恍神了，什麼都沒想到……"
             cleaned = re.sub(r"\(.*?(?:sentences?|persona|words?|rules?|sentence).*?\)", "", raw, flags=re.IGNORECASE)
             return re.sub(r"^\s*[*•\-]+\s*$", "", cleaned, flags=re.MULTILINE).strip()
         except Exception as e:
             last_exc = e
             if any(k in str(e) for k in ["404", "503", "NOT_FOUND", "UNAVAILABLE"]):
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.3)
                 continue
             raise e
     raise last_exc or RuntimeError("無可用模型")
@@ -289,7 +286,6 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # 觸發條件：私訊、@Mention、手打鯊逼名字、或回覆機器人訊息
     is_dm = isinstance(message.channel, discord.DMChannel)
     is_mentioned = bot.user in message.mentions
     has_name = any(n in message.content for n in ["鯊逼", "鯊鯊", "小鯊魚", "@鯊逼"])
@@ -303,7 +299,6 @@ async def on_message(message: discord.Message):
     if not (is_dm or is_mentioned or has_name or is_reply):
         return
 
-    # 清除前綴標籤
     clean = message.content
     if bot.user:
         clean = re.sub(rf"<@!?{bot.user.id}>", "", clean)
@@ -316,17 +311,24 @@ async def on_message(message: discord.Message):
         return
 
     cid = message.channel.id
-    prompt_payload = f"{clean}\n\n{get_server_context(message)}"
-    memory_manager.add_message(cid, role="user", text=prompt_payload)
+
+    # 1. 記憶庫只存乾淨的對話文字（杜絕 Context 累積重複情報造成的延遲）
+    memory_manager.add_message(cid, role="user", text=clean)
+
+    # 2. 取出歷史對話，僅在「當前最新這則」附帶即時情報
+    contents_to_send = memory_manager.get_contents(cid)
+    if contents_to_send:
+        server_ctx = get_server_context(message)
+        last_parts = [types.Part.from_text(text=f"{clean}\n\n{server_ctx}")]
+        contents_to_send[-1] = types.Content(role="user", parts=last_parts)
 
     async with message.channel.typing():
         try:
             logger.info(f"收到來自 [{message.author.display_name}] 的訊息: {clean}")
-            raw_reply = await call_gemini(memory_manager.get_contents(cid))
+            raw_reply = await call_gemini(contents_to_send)
             final_reply = await process_voice_actions(raw_reply, message, clean)
             memory_manager.add_message(cid, role="model", text=final_reply)
 
-            # 超過 1900 字自動分段發送
             if len(final_reply) > 1900:
                 for i in range(0, len(final_reply), 1900):
                     chunk = final_reply[i:i + 1900]
