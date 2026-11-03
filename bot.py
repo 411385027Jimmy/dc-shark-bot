@@ -124,7 +124,6 @@ def get_server_context(message: discord.Message) -> str:
 
 
 def detect_fallback_action(content: str) -> Optional[Tuple[str, bool]]:
-    """依文字關鍵字判斷意圖"""
     c = content.lower()
     if any(k in c for k in ["踢出", "踢掉", "踢他", "踢走", "拍飛", "踢"]):
         return "KICK", True
@@ -148,10 +147,8 @@ async def process_voice_actions(reply_text: str, message: discord.Message, raw_p
     matches = action_pattern.findall(reply_text)
     cleaned_reply = action_pattern.sub("", reply_text).strip()
 
-    # 取得訊息中所有被 @mention 的非機器人成員（包括發言者自己）
     target_mentions = [m for m in message.mentions if m.id != bot.user.id]
 
-    # 【絕對安全防線】：只有在訊息中有實際 @TAG 目標時，才允許執行語音操作！
     if not target_mentions:
         return cleaned_reply
 
@@ -215,26 +212,40 @@ async def on_ready():
         logger.info(f"專屬頻道限制已生效，僅在頻道 ID: {ALLOWED_CHANNEL_ID} 或私訊回覆")
 
 
-async def call_gemini(contents):
+def _sync_gemini_generate(model_name: str, contents: list) -> str:
+    """在工作線程中同步執行 API 呼叫，徹底避免阻塞主 Event Loop"""
+    res = gemini_client.models.generate_content(
+        model=model_name,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            temperature=0.85,
+            max_output_tokens=600,
+        ),
+    )
+    raw = res.text.strip() if res.text else "嘎嗷？本鯊恍神了，什麼都沒想到……"
+    cleaned = re.sub(r"\(.*?(?:sentences?|persona|words?|rules?|sentence).*?\)", "", raw, flags=re.IGNORECASE)
+    return re.sub(r"^\s*[*•\-]+\s*$", "", cleaned, flags=re.MULTILINE).strip()
+
+
+async def call_gemini(contents) -> str:
+    """非同步包裝與超時保護：丟入線程池，主線程心跳包 100% 暢通，25 秒超時保護"""
     last_exc = None
     for model_name in CANDIDATE_MODELS:
         try:
             t0 = time.time()
-            res = await gemini_client.aio.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,
-                    temperature=0.85,
-                    max_output_tokens=600,
-                ),
+            # 關鍵修正：透過 asyncio.to_thread 移至獨立工作線程，避免卡住主線程 Heartbeat
+            # 加上 25.0 秒逾時保護
+            reply_text = await asyncio.wait_for(
+                asyncio.to_thread(_sync_gemini_generate, model_name, contents),
+                timeout=25.0,
             )
             cost = time.time() - t0
             logger.info(f"Gemini 生成完成 [{model_name}] 耗時: {cost:.2f} 秒")
-
-            raw = res.text.strip() if res.text else "嘎嗷？本鯊恍神了，什麼都沒想到……"
-            cleaned = re.sub(r"\(.*?(?:sentences?|persona|words?|rules?|sentence).*?\)", "", raw, flags=re.IGNORECASE)
-            return re.sub(r"^\s*[*•\-]+\s*$", "", cleaned, flags=re.MULTILINE).strip()
+            return reply_text
+        except asyncio.TimeoutError:
+            logger.warning(f"模型 {model_name} 呼叫逾時（超過 25 秒）！")
+            raise asyncio.TimeoutError("Gemini 呼叫逾時")
         except Exception as e:
             last_exc = e
             if any(k in str(e) for k in ["404", "503", "NOT_FOUND", "UNAVAILABLE"]):
@@ -249,78 +260,84 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # 1. 嚴格檢查：只有在私訊 (DM) 或是真正被 @mention 時才可能處理
-    is_dm = isinstance(message.channel, discord.DMChannel)
-    is_mentioned = bot.user in message.mentions
+    try:
+        # 1. 嚴格檢查：只有在私訊 (DM) 或是真正被 @mention 時才可能處理
+        is_dm = isinstance(message.channel, discord.DMChannel)
+        is_mentioned = bot.user in message.mentions
 
-    if not (is_dm or is_mentioned):
-        return
+        if not (is_dm or is_mentioned):
+            return
 
-    # 2. 專屬聊天室限制：若非私訊，且不在專屬頻道內，直接略過
-    if not is_dm and ALLOWED_CHANNEL_ID and message.channel.id != ALLOWED_CHANNEL_ID:
-        return
+        # 2. 專屬聊天室限制：若非私訊，且不在專屬頻道內，直接略過
+        if not is_dm and ALLOWED_CHANNEL_ID and message.channel.id != ALLOWED_CHANNEL_ID:
+            return
 
-    # 清除對機器人的 @mention 前綴
-    clean = message.content
-    if bot.user:
-        clean = re.sub(rf"<@!?{bot.user.id}>", "", clean).strip()
+        # 清除對機器人的 @mention 前綴
+        clean = message.content
+        if bot.user:
+            clean = re.sub(rf"<@!?{bot.user.id}>", "", clean).strip()
 
-    if not clean:
-        clean = "（戳了戳鯊鯊）"
+        if not clean:
+            clean = "（戳了戳鯊鯊）"
 
-    if not gemini_client:
-        await message.channel.send("嗷嗚！飼主還沒設定 GEMINI_API_KEY，本鯊現在腦袋空空嘎嗷！")
-        return
+        if not gemini_client:
+            await message.channel.send("嗷嗚！飼主還沒設定 GEMINI_API_KEY，本鯊現在腦袋空空嘎嗷！")
+            return
 
-    cid = message.channel.id
+        cid = message.channel.id
 
-    # 記憶庫只存乾淨的對話文字
-    memory_manager.add_message(cid, role="user", text=clean)
+        # 記憶庫只存乾淨的對話文字
+        memory_manager.add_message(cid, role="user", text=clean)
 
-    # 判斷是否需要注入語音房情報
-    other_mentions = [m for m in message.mentions if m.id != bot.user.id]
-    needs_voice_info = bool(other_mentions or any(k in clean for k in ["語音", "語音房", "踢", "靜音", "拒聽", "誰在"]))
+        # 判斷是否需要注入語音房情報
+        other_mentions = [m for m in message.mentions if m.id != bot.user.id]
+        needs_voice_info = bool(other_mentions or any(k in clean for k in ["語音", "語音房", "踢", "靜音", "拒聽", "誰在"]))
 
-    contents_to_send = memory_manager.get_contents(cid)
-    if contents_to_send and needs_voice_info:
-        server_ctx = get_server_context(message)
-        last_parts = [types.Part.from_text(text=f"{clean}\n\n{server_ctx}")]
-        contents_to_send[-1] = types.Content(role="user", parts=last_parts)
+        contents_to_send = memory_manager.get_contents(cid)
+        if contents_to_send and needs_voice_info:
+            server_ctx = get_server_context(message)
+            last_parts = [types.Part.from_text(text=f"{clean}\n\n{server_ctx}")]
+            contents_to_send[-1] = types.Content(role="user", parts=last_parts)
 
-    async with message.channel.typing():
-        try:
-            logger.info(f"收到來自 [{message.author.display_name}] 的訊息: {clean}")
-            raw_reply = await call_gemini(contents_to_send)
-            final_reply = await process_voice_actions(raw_reply, message, clean)
-            memory_manager.add_message(cid, role="model", text=final_reply)
+        async with message.channel.typing():
+            try:
+                logger.info(f"收到來自 [{message.author.display_name}] 的訊息: {clean}")
+                raw_reply = await call_gemini(contents_to_send)
+                final_reply = await process_voice_actions(raw_reply, message, clean)
+                memory_manager.add_message(cid, role="model", text=final_reply)
 
-            if len(final_reply) > 1900:
-                for i in range(0, len(final_reply), 1900):
-                    chunk = final_reply[i:i + 1900]
-                    if i == 0:
-                        await message.reply(chunk, mention_author=False)
-                    else:
-                        await message.channel.send(chunk)
-            else:
-                await message.reply(final_reply, mention_author=False)
+                if len(final_reply) > 1900:
+                    for i in range(0, len(final_reply), 1900):
+                        chunk = final_reply[i:i + 1900]
+                        if i == 0:
+                            await message.reply(chunk, mention_author=False)
+                        else:
+                            await message.channel.send(chunk)
+                else:
+                    await message.reply(final_reply, mention_author=False)
 
-        except Exception as e:
-            logger.error(f"Gemini API 異常: {e}", exc_info=True)
-            memory_manager.pop_last_if_role(cid, "user")
-            await message.reply("咬你喔 ( º言º )！本鯊剛才咬到網路線當機了嗷嗚……等下再試試！", mention_author=False)
+            except asyncio.TimeoutError:
+                logger.warning("Gemini 回應超時 (25秒)")
+                memory_manager.pop_last_if_role(cid, "user")
+                await message.reply("咬你喔 ( º言º )！這問題太難了，本鯊腦袋直接燒壞超時了嗷嗚……等下再問！", mention_author=False)
+            except Exception as e:
+                logger.error(f"Gemini API 異常: {e}", exc_info=True)
+                memory_manager.pop_last_if_role(cid, "user")
+                await message.reply("咬你喔 ( º言º )！本鯊剛才咬到網路線當機了嗷嗚……等下再試試！", mention_author=False)
 
-    await bot.process_commands(message)
+        await bot.process_commands(message)
+
+    except Exception as e:
+        logger.error(f"on_message 頂層未預期錯誤: {e}", exc_info=True)
 
 # ---------------------------------------------------------------------------
 # Render Web Service Health Check HTTP 伺服器
 # ---------------------------------------------------------------------------
 async def handle_ping(request: web.Request) -> web.Response:
-    """Render 健康檢查路由，回傳 200 OK 避免容器重啟"""
     return web.Response(text="SharkBot is swimming and alive! 🦈 Status: OK\n", status=200)
 
 
 async def start_web_server():
-    """在 Render 指派的 PORT 上啟動輕量 aiohttp Web 伺服器"""
     app = web.Application()
     app.router.add_get("/", handle_ping)
     app.router.add_get("/healthz", handle_ping)
