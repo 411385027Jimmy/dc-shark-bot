@@ -40,7 +40,7 @@ CANDIDATE_MODELS = [DEFAULT_MODEL, "gemini-3.5-flash-lite", "gemini-3.1-flash-li
 CANDIDATE_MODELS = list(dict.fromkeys(CANDIDATE_MODELS))
 
 # ---------------------------------------------------------------------------
-# 鯊鯊人設與指令規則（優化語速與長度）
+# 鯊鯊人設與指令規則
 # ---------------------------------------------------------------------------
 SYSTEM_PROMPT = """你是一隻名叫「鯊逼」的呆萌小鯊魚吉祥物，頭像是隻可愛的鯊鯊。
 自稱與口吻：
@@ -263,7 +263,7 @@ async def call_gemini(contents):
                 config=types.GenerateContentConfig(
                     system_instruction=SYSTEM_PROMPT,
                     temperature=0.85,
-                    max_output_tokens=600,  # 適中的 token 上限，極速秒回！
+                    max_output_tokens=600,
                 ),
             )
             cost = time.time() - t0
@@ -286,23 +286,18 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
+    # 嚴格觸發規則：只有在私訊 (DM) 或是真正被 @mention 時才理人
     is_dm = isinstance(message.channel, discord.DMChannel)
     is_mentioned = bot.user in message.mentions
-    has_name = any(n in message.content for n in ["鯊逼", "鯊鯊", "小鯊魚", "@鯊逼"])
-    is_reply = bool(
-        message.reference
-        and message.reference.resolved
-        and getattr(message.reference.resolved, "author", None)
-        and message.reference.resolved.author.id == bot.user.id
-    )
 
-    if not (is_dm or is_mentioned or has_name or is_reply):
+    if not (is_dm or is_mentioned):
         return
 
+    # 清除 @mention 前綴
     clean = message.content
     if bot.user:
-        clean = re.sub(rf"<@!?{bot.user.id}>", "", clean)
-    clean = re.sub(r"@?鯊逼|@?鯊鯊|小鯊魚", "", clean, count=1).strip()
+        clean = re.sub(rf"<@!?{bot.user.id}>", "", clean).strip()
+
     if not clean:
         clean = "（戳了戳鯊鯊）"
 
@@ -312,10 +307,10 @@ async def on_message(message: discord.Message):
 
     cid = message.channel.id
 
-    # 1. 記憶庫只存乾淨的對話文字（杜絕 Context 累積重複情報造成的延遲）
+    # 記憶庫只存乾淨的對話文字
     memory_manager.add_message(cid, role="user", text=clean)
 
-    # 2. 取出歷史對話，僅在「當前最新這則」附帶即時情報
+    # 僅在最新這則附加即時伺服器動態情報
     contents_to_send = memory_manager.get_contents(cid)
     if contents_to_send:
         server_ctx = get_server_context(message)
