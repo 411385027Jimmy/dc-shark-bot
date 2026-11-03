@@ -36,6 +36,10 @@ DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
 
+# 專屬聊天室頻道 ID 限制（預設 1567111900402286763）
+ALLOWED_CHANNEL_RAW = os.getenv("ALLOWED_CHANNEL_ID", "1567111900402286763").strip()
+ALLOWED_CHANNEL_ID = int(ALLOWED_CHANNEL_RAW) if ALLOWED_CHANNEL_RAW.isdigit() else None
+
 CANDIDATE_MODELS = [DEFAULT_MODEL, "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 CANDIDATE_MODELS = list(dict.fromkeys(CANDIDATE_MODELS))
 
@@ -64,7 +68,7 @@ SYSTEM_PROMPT = """你是一隻名叫「鯊逼」的呆萌小鯊魚吉祥物，�
 """
 
 # ---------------------------------------------------------------------------
-# 滑動視窗（Sliding Window）記憶體管理（純淨版，不存臃腫情報）
+# 滑動視窗（Sliding Window）記憶體管理
 # ---------------------------------------------------------------------------
 class SlidingWindowMemory:
     """各頻道維護最近 10 則對話紀錄，只存乾淨聊天內容以維持極速回應"""
@@ -250,6 +254,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     logger.info(f"Bot is ready! Logged in as {bot.user.name}")
     print(f"Bot is ready! Logged in as {bot.user.name}")
+    if ALLOWED_CHANNEL_ID:
+        logger.info(f"專屬頻道限制已生效，僅在頻道 ID: {ALLOWED_CHANNEL_ID} 或私訊回覆")
+        print(f"專屬頻道限制已生效，僅在頻道 ID: {ALLOWED_CHANNEL_ID} 或私訊回覆")
 
 
 async def call_gemini(contents):
@@ -286,11 +293,15 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # 嚴格觸發規則：只有在私訊 (DM) 或是真正被 @mention 時才理人
+    # 1. 嚴格檢查：只有在私訊 (DM) 或真正被 @mention 時才可能處理
     is_dm = isinstance(message.channel, discord.DMChannel)
     is_mentioned = bot.user in message.mentions
 
     if not (is_dm or is_mentioned):
+        return
+
+    # 2. 專屬聊天室限制：若非私訊，且訊息不在指定頻道 ID 內，直接略過不做任何回覆
+    if not is_dm and ALLOWED_CHANNEL_ID and message.channel.id != ALLOWED_CHANNEL_ID:
         return
 
     # 清除 @mention 前綴
@@ -319,7 +330,7 @@ async def on_message(message: discord.Message):
 
     async with message.channel.typing():
         try:
-            logger.info(f"收到來自 [{message.author.display_name}] 的訊息: {clean}")
+            logger.info(f"收到來自 [{message.author.display_name}] 的訊息 (頻道: {message.channel.id}): {clean}")
             raw_reply = await call_gemini(contents_to_send)
             final_reply = await process_voice_actions(raw_reply, message, clean)
             memory_manager.add_message(cid, role="model", text=final_reply)
