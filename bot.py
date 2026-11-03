@@ -36,7 +36,6 @@ DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
 
-# 專屬聊天室頻道 ID 限制（預設 1567111900402286763）
 ALLOWED_CHANNEL_RAW = os.getenv("ALLOWED_CHANNEL_ID", "1567111900402286763").strip()
 ALLOWED_CHANNEL_ID = int(ALLOWED_CHANNEL_RAW) if ALLOWED_CHANNEL_RAW.isdigit() else None
 
@@ -55,23 +54,22 @@ SYSTEM_PROMPT = """你是一隻名叫「鯊逼」的呆萌小鯊魚吉祥物，�
 說話風格：
 - 回覆保持簡潔有力、率性自然（維持在 2~4 句話左右），像在聊天室快速打字的小鯊魚，絕不講冗長大道理！
 - 遇到太難的問題，大腦會直接進入放棄思考、天然呆或吐槽模式。
+- 平常請專注在聊天、回答問題或調侃大家，不要沒事主動找藉口踢人。
 
-【語音房實體操作特權 (Action Tags)】
-只要群裡的人類命令你對語音房的成員進行制裁，你都會當成好玩的遊戲去咬人！
-請務必在回覆中加入相應標籤（系統會自動為你執行動作）：
+【語音房實體操作特權（必須有明確 @提及目標 才會觸發）】
+只有當人類在訊息中明確 @標註了目標成員，並下達踢人或靜音等命令時，你才配合執行動作（在回覆中加入相應標籤）：
 - 靜音：[[ACTION:MUTE, 目標名稱, true]]
 - 解除靜音：[[ACTION:MUTE, 目標名稱, false]]
 - 拒聽：[[ACTION:DEAFEN, 目標名稱, true]]
 - 解除拒聽：[[ACTION:DEAFEN, 目標名稱, false]]
 - 踢出語音房：[[ACTION:KICK, 目標名稱]]
-- 若對方說「踢掉他們/全踢了」，請為語音房內「發言者以外的人」分別輸出多個 KICK 標籤。
 """
 
 # ---------------------------------------------------------------------------
 # 滑動視窗（Sliding Window）記憶體管理
 # ---------------------------------------------------------------------------
 class SlidingWindowMemory:
-    """各頻道維護最近 10 則對話紀錄，只存乾淨聊天內容以維持極速回應"""
+    """各頻道維護最近 10 則對話紀錄，只存乾淨聊天內容"""
     def __init__(self, max_messages: int = 10):
         self._storage: Dict[int, deque] = defaultdict(lambda: deque(maxlen=max_messages))
 
@@ -124,65 +122,20 @@ def get_server_context(message: discord.Message) -> str:
     return "\n".join(lines)
 
 
-def find_target_member(guild: discord.Guild, target_name: str, message: discord.Message) -> Optional[discord.Member]:
-    """超級模糊搜尋目標成員（支援 Mention、ID、暱稱部分關鍵字、唯一候選人）"""
-    non_bot_mentions = [m for m in message.mentions if m.id != bot.user.id]
-    if len(non_bot_mentions) == 1:
-        return non_bot_mentions[0]
-
-    target = re.sub(r"[<@!>]", "", target_name.strip().lower())
-    active_voice = [m for vc in guild.voice_channels for m in vc.members if m.id != message.author.id and m.id != bot.user.id]
-
-    if len(active_voice) == 1 and (not target or any(k in target for k in ["他", "這", "那", "人"])):
-        return active_voice[0]
-
-    for pool in (active_voice, guild.members):
-        for m in pool:
-            if m.id == bot.user.id:
-                continue
-            disp, name, mid = m.display_name.lower(), m.name.lower(), str(m.id)
-            if target == mid or target in disp or target in name or disp in target or name in target:
-                return m
-    return None
-
-
-def detect_fallback_action(content: str, message: discord.Message) -> Optional[List[Tuple[str, str, bool]]]:
-    """若 AI 偶爾忘記輸出 Action 標籤，由程式碼依關鍵字自動攔截補位"""
+def detect_fallback_action(content: str) -> Optional[Tuple[str, bool]]:
+    """依文字關鍵字判斷意圖"""
     c = content.lower()
-    action, enable = None, True
-
     if any(k in c for k in ["踢出", "踢掉", "踢他", "踢走", "拍飛", "踢"]):
-        action = "KICK"
+        return "KICK", True
     elif any(k in c for k in ["解靜音", "解除靜音", "說話", "開麥"]):
-        action, enable = "MUTE", False
+        return "MUTE", False
     elif any(k in c for k in ["靜音", "閉嘴", "封嘴", "別吵", "閉上嘴"]):
-        action, enable = "MUTE", True
+        return "MUTE", True
     elif any(k in c for k in ["解拒聽", "解除拒聽"]):
-        action, enable = "DEAFEN", False
+        return "DEAFEN", False
     elif any(k in c for k in ["拒聽", "堵耳朵", "耳聾"]):
-        action, enable = "DEAFEN", True
-
-    if not action:
-        return None
-
-    guild = message.guild
-    if guild and any(k in c for k in ["他們", "大家", "所有人", "全部", "倆個", "兩個"]):
-        targets = [
-            (action, m.display_name, enable)
-            for vc in guild.voice_channels
-            for m in vc.members
-            if m.id != message.author.id and m.id != bot.user.id
-        ]
-        if targets:
-            return targets
-
-    mentions = [m for m in message.mentions if m.id != bot.user.id]
-    tgt = mentions[0].display_name if mentions else ""
-    if not tgt:
-        for w in ["把", "讓", "叫", "踢出", "踢掉", "踢他", "拍飛", "踢", "靜音", "閉嘴", "說話", "拒聽", "他", "了"]:
-            c = c.replace(w, " ")
-        tgt = c.strip()
-    return [(action, tgt, enable)]
+        return "DEAFEN", True
+    return None
 
 
 async def process_voice_actions(reply_text: str, message: discord.Message, raw_prompt: str) -> str:
@@ -194,46 +147,52 @@ async def process_voice_actions(reply_text: str, message: discord.Message, raw_p
     matches = action_pattern.findall(reply_text)
     cleaned_reply = action_pattern.sub("", reply_text).strip()
 
-    if not matches:
-        fb = detect_fallback_action(raw_prompt, message)
-        if fb:
-            matches = [(act, tgt, str(en)) for act, tgt, en in fb]
+    # 取得訊息中所有被 @mention 的非機器人成員（包括發言者自己）
+    target_mentions = [m for m in message.mentions if m.id != bot.user.id]
 
-    if not matches:
+    # 【絕對安全防線】：只有在訊息中有實際 @TAG 目標時，才允許執行語音操作！
+    # 沒 TAG 人就只是普通聊天，絕不執行任何踢人或靜音動作
+    if not target_mentions:
+        return cleaned_reply
+
+    # 判斷動作類型（由 AI 標籤或關鍵字 Fallback 決定）
+    actions_to_execute = []
+    if matches:
+        for act_type, _, param in matches:
+            act = act_type.strip().upper()
+            is_enable = (param.strip().lower() != "false") if param else True
+            actions_to_execute.append((act, is_enable))
+    else:
+        fb = detect_fallback_action(raw_prompt)
+        if fb:
+            actions_to_execute.append(fb)
+
+    if not actions_to_execute:
         return cleaned_reply
 
     feedback_notes = []
-    for action_type, raw_target, param in matches:
-        act = action_type.strip().upper()
-        tgt = raw_target.strip()
-        is_enable = (param.strip().lower() != "false") if param else True
 
-        member = find_target_member(guild, tgt, message)
-        if not member:
-            feedback_notes.append(f"*(⚠️ 咬空了：在伺服器找不到「{tgt}」，建議直接 @ 他喔！)*")
-            continue
+    # 針對實際被 @TAG 的成員執行動作
+    for act, is_enable in actions_to_execute:
+        for member in target_mentions:
+            if not member.voice or not member.voice.channel:
+                feedback_notes.append(f"*(⚠️ 撲空了：{member.display_name} 目前不在語音房裡！)*")
+                continue
 
-        if member.id == message.author.id and not any(k in raw_prompt.lower() for k in ["自己", "我也"]):
-            continue
-
-        if not member.voice or not member.voice.channel:
-            feedback_notes.append(f"*(⚠️ 撲空了：{member.display_name} 目前不在語音房裡！)*")
-            continue
-
-        try:
-            if act == "MUTE":
-                await member.edit(mute=is_enable)
-                feedback_notes.append(f"*(🦈 動作已執行：已將 @{member.display_name} {'伺服器靜音' if is_enable else '解除靜音'})*")
-            elif act == "DEAFEN":
-                await member.edit(deafen=is_enable)
-                feedback_notes.append(f"*(🦈 動作已執行：已將 @{member.display_name} {'伺服器拒聽' if is_enable else '解除拒聽'})*")
-            elif act == "KICK":
-                await member.move_to(None)
-                feedback_notes.append(f"*(🦈 動作已執行：已一尾巴將 @{member.display_name} 拍飛踢出語音房！)*")
-        except discord.Forbidden:
-            feedback_notes.append(f"*(⚠️ 咬不動嗷嗚：Discord 拒絕執行！因為「{member.display_name}」擁有【管理員權限】或身分組階級高於本鯊！)*")
-        except Exception as e:
-            feedback_notes.append(f"*(⚠️ 操作失敗：{e})*")
+            try:
+                if act == "MUTE":
+                    await member.edit(mute=is_enable)
+                    feedback_notes.append(f"*(🦈 動作已執行：已將 @{member.display_name} {'伺服器靜音' if is_enable else '解除靜音'})*")
+                elif act == "DEAFEN":
+                    await member.edit(deafen=is_enable)
+                    feedback_notes.append(f"*(🦈 動作已執行：已將 @{member.display_name} {'伺服器拒聽' if is_enable else '解除拒聽'})*")
+                elif act == "KICK":
+                    await member.move_to(None)
+                    feedback_notes.append(f"*(🦈 動作已執行：已一尾巴將 @{member.display_name} 拍飛踢出語音房！)*")
+            except discord.Forbidden:
+                feedback_notes.append(f"*(⚠️ 咬不動嗷嗚：Discord 拒絕執行！因為「{member.display_name}」擁有【管理員權限】或身分組階級高於本鯊！)*")
+            except Exception as e:
+                feedback_notes.append(f"*(⚠️ 操作失敗：{e})*")
 
     if feedback_notes:
         cleaned_reply = f"{cleaned_reply}\n\n" + "\n".join(feedback_notes)
@@ -256,7 +215,6 @@ async def on_ready():
     print(f"Bot is ready! Logged in as {bot.user.name}")
     if ALLOWED_CHANNEL_ID:
         logger.info(f"專屬頻道限制已生效，僅在頻道 ID: {ALLOWED_CHANNEL_ID} 或私訊回覆")
-        print(f"專屬頻道限制已生效，僅在頻道 ID: {ALLOWED_CHANNEL_ID} 或私訊回覆")
 
 
 async def call_gemini(contents):
@@ -293,18 +251,18 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # 1. 嚴格檢查：只有在私訊 (DM) 或真正被 @mention 時才可能處理
     is_dm = isinstance(message.channel, discord.DMChannel)
     is_mentioned = bot.user in message.mentions
 
+    # 1. 嚴格檢查：只有在私訊 (DM) 或是真正被 @mention 時才可能處理
     if not (is_dm or is_mentioned):
         return
 
-    # 2. 專屬聊天室限制：若非私訊，且訊息不在指定頻道 ID 內，直接略過不做任何回覆
+    # 2. 專屬聊天室限制：若非私訊，且不在專屬頻道內，直接略過
     if not is_dm and ALLOWED_CHANNEL_ID and message.channel.id != ALLOWED_CHANNEL_ID:
         return
 
-    # 清除 @mention 前綴
+    # 清除對機器人的 @mention 前綴（保留可能 @其他目標 的標籤給意圖判斷）
     clean = message.content
     if bot.user:
         clean = re.sub(rf"<@!?{bot.user.id}>", "", clean).strip()
@@ -321,16 +279,19 @@ async def on_message(message: discord.Message):
     # 記憶庫只存乾淨的對話文字
     memory_manager.add_message(cid, role="user", text=clean)
 
-    # 僅在最新這則附加即時伺服器動態情報
+    # 判斷是否需要注入語音房情報（只有當使用者在問語音房，或者有 @其他人 時才注入，避免誘發 AI 踢人）
+    other_mentions = [m for m in message.mentions if m.id != bot.user.id]
+    needs_voice_info = bool(other_mentions or any(k in clean for k in ["語音", "語音房", "踢", "靜音", "拒聽", "誰在"]))
+
     contents_to_send = memory_manager.get_contents(cid)
-    if contents_to_send:
+    if contents_to_send and needs_voice_info:
         server_ctx = get_server_context(message)
         last_parts = [types.Part.from_text(text=f"{clean}\n\n{server_ctx}")]
         contents_to_send[-1] = types.Content(role="user", parts=last_parts)
 
     async with message.channel.typing():
         try:
-            logger.info(f"收到來自 [{message.author.display_name}] 的訊息 (頻道: {message.channel.id}): {clean}")
+            logger.info(f"收到來自 [{message.author.display_name}] 的訊息: {clean}")
             raw_reply = await call_gemini(contents_to_send)
             final_reply = await process_voice_actions(raw_reply, message, clean)
             memory_manager.add_message(cid, role="model", text=final_reply)
