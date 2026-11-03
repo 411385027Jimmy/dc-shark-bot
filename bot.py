@@ -59,6 +59,10 @@ SYSTEM_PROMPT = """你是一隻名叫「鯊逼」的呆萌小鯊魚吉祥物，�
 說話風格：
 - 率性自然！像一隻活生生在聊天室跟人打字互動的調皮小鯊魚，想說什麼就說什麼，隨性發揮。
 - 絕對不要像客服一樣客套禮貌，也不要寫得像說明書或論文一樣死板冗長。
+
+伺服器情報感知能力：
+- 系統會在每則對話附帶【當前 Discord 伺服器即時情報】（包含伺服器名稱、有哪些語音房、誰在語音房裡等）。
+- 當人類問起伺服器狀態、有哪些語音房、語音房裡現在有誰、或者你在哪裡時，請用小鯊魚的調皮口吻靈活運用這些最新情報回答或吐槽他們（例如吐槽他們在語音房摸魚不分魚吃、或是吐槽語音房空蕩蕩冷冰冰）！
 """
 
 # ---------------------------------------------------------------------------
@@ -72,6 +76,42 @@ def sanitize_reply(text: str) -> str:
     cleaned = re.sub(r"^\s*[*•\-]+\s*$", "", cleaned, flags=re.MULTILINE)
     cleaned = cleaned.strip()
     return cleaned if cleaned else text.strip()
+
+
+def get_server_context(message: discord.Message) -> str:
+    """抓取當前伺服器的即時動態情報（語音房名稱、裡面有誰、文字頻道等）"""
+    guild = message.guild
+    if not guild:
+        return "【目前狀態：私訊 (DM)，無伺服器與語音頻道資訊】"
+
+    author_name = message.author.display_name
+    lines = [
+        "【當前 Discord 伺服器即時情報】",
+        f"- 伺服器名稱：{guild.name}",
+        f"- 伺服器總人數：{guild.member_count} 人",
+        f"- 正在跟你說話的人類：{author_name}",
+    ]
+
+    # 語音頻道與房內成員
+    voice_channels = guild.voice_channels
+    if voice_channels:
+        lines.append("- 語音頻道即時動態：")
+        for vc in voice_channels:
+            members = [m.display_name for m in vc.members]
+            if members:
+                lines.append(f"  * 🔊 語音房「{vc.name}」：有 {len(members)} 人在裡面（成員：{', '.join(members)}）")
+            else:
+                lines.append(f"  * 🔊 語音房「{vc.name}」：目前空無一人")
+    else:
+        lines.append("- 語音頻道狀態：本伺服器目前沒有建立任何語音頻道")
+
+    # 文字頻道列表（前 10 個）
+    text_channels = [tc.name for tc in guild.text_channels[:10]]
+    if text_channels:
+        lines.append(f"- 部份文字頻道：{', '.join(text_channels)}")
+
+    return "\n".join(lines)
+
 
 # ---------------------------------------------------------------------------
 # 滑動視窗（Sliding Window）記憶體管理器
@@ -126,6 +166,7 @@ else:
 # ---------------------------------------------------------------------------
 intents = discord.Intents.default()
 intents.message_content = True
+intents.voice_states = True  # 開啟語音狀態監聽，能夠即時掌握誰在語音房內
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -148,7 +189,7 @@ async def call_gemini_with_fallback(contents):
                 config=types.GenerateContentConfig(
                     system_instruction=SYSTEM_PROMPT,
                     temperature=0.88,
-                    max_output_tokens=1500,  # 充沛的上限，放開拘束隨性說話
+                    max_output_tokens=1500,
                 ),
             )
             raw_text = response.text.strip() if response.text else "嘎嗷？本鯊恍神了，什麼都沒想到……"
@@ -192,8 +233,12 @@ async def on_message(message: discord.Message):
 
     channel_id = message.channel.id
 
-    # 將使用者輸入加入滑動視窗
-    memory_manager.add_message(channel_id, role="user", text=cleaned_content)
+    # 抓取即時伺服器動態情報
+    server_info = get_server_context(message)
+    prompt_payload = f"{cleaned_content}\n\n{server_info}"
+
+    # 將使用者輸入與即時情報加入滑動視窗
+    memory_manager.add_message(channel_id, role="user", text=prompt_payload)
     history_contents = memory_manager.get_contents(channel_id)
 
     async with message.channel.typing():
