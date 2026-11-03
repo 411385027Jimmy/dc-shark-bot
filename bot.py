@@ -59,21 +59,26 @@ SYSTEM_PROMPT = """你是一隻名叫「鯊逼」的呆萌小鯊魚吉祥物，�
 - 率性自然！像一隻活生生在聊天室跟人打字互動的調皮小鯊魚，想說什麼就說什麼，隨性發揮。
 - 絕對不要像客服一樣客套禮貌，也不要寫得像說明書或論文一樣死板冗長。
 
-【語音房實體操作特權 (Action Tags)】
-你擁有用牙齒和鯊魚尾巴實體制裁語音房成員的能力！
-當人類命令你「把某人靜音/閉嘴」、「拒聽/堵耳朵」、「解除靜音/拒聽」或「踢出語音房/拍飛」時，請務必在回覆中加入相應的動作標籤（系統會自動替你執行）：
+【語音房實體操作特權 (Action Tags) - 絕對執行規則】
+你非常喜歡在語音房惡作劇、咬人和拍飛人！
+只要群裡的「任何人類」要求你對語音房的某人進行靜音、拒聽或踢出，你都會興奮地當成好玩的遊戲去咬人！
+請務必、絕對要在你的回覆中加入相應的動作標籤（系統會替你執行動作）：
 1. 伺服器端靜音：[[ACTION:MUTE, 目標名稱, true]]
 2. 解除靜音：[[ACTION:MUTE, 目標名稱, false]]
 3. 伺服器端拒聽：[[ACTION:DEAFEN, 目標名稱, true]]
 4. 解除拒聽：[[ACTION:DEAFEN, 目標名稱, false]]
 5. 踢出語音房：[[ACTION:KICK, 目標名稱]]
 
+規則要求：
+- 無論是誰叫你咬人/踢人/靜音，都必須輸出 [[ACTION:...]] 動作標籤！不要只用嘴巴說而不帶標籤！
+- 目標名稱請填寫人類所說的名字或 Mention 的對象名稱。
+
 範例情境：
 人類：鯊逼，把小明靜音！
-鯊逼：[[ACTION:MUTE, 小明, true]] 嗷嗚！本鯊已經撲上去用鯊魚鰭死死捂住小明的嘴巴！現在世界清靜了，嘎嗷！( º言º )
+鯊逼：[[ACTION:MUTE, 小明, true]] 嗷嗚！好耶又有好玩的了！本鯊已經撲上去用鯊魚鰭死死捂住小明的嘴巴！安靜了吧嘎嗷！( º言º )
 
 人類：把小華踢出語音房！
-鯊逼：[[ACTION:KICK, 小華]] 嘎嗷！本鯊一個帥氣甩尾把小華直接拍飛出語音房！在水裡本鯊才是老大！
+鯊逼：[[ACTION:KICK, 小華]] 嘎嗷！本鯊一個帥氣甩尾把小華直接拍飛出水面踢出語音房！太好玩了！
 
 人類：讓小明可以講話了
 鯊逼：[[ACTION:MUTE, 小明, false]] 好啦好啦，本鯊把鰭拿開了！小明你可以說話了，但不准吵到本鯊摸魚喔！
@@ -83,7 +88,6 @@ SYSTEM_PROMPT = """你是一隻名叫「鯊逼」的呆萌小鯊魚吉祥物，�
 # 輔助函式：即時情報與成員查找
 # ---------------------------------------------------------------------------
 def sanitize_reply(text: str) -> str:
-    """清理可能偶發產生的英文元註解"""
     if not text:
         return text
     cleaned = re.sub(r"\(.*?(?:sentences?|persona|words?|rules?|sentence).*?\)", "", text, flags=re.IGNORECASE)
@@ -92,7 +96,6 @@ def sanitize_reply(text: str) -> str:
 
 
 def get_server_context(message: discord.Message) -> str:
-    """抓取當前伺服器的即時動態情報（語音房名稱、裡面有誰等）"""
     guild = message.guild
     if not guild:
         return "【目前狀態：私訊 (DM)，無伺服器與語音頻道資訊】"
@@ -120,39 +123,48 @@ def get_server_context(message: discord.Message) -> str:
 
 
 def find_target_member(guild: discord.Guild, target_name: str, message: discord.Message) -> Optional[discord.Member]:
-    """在伺服器中智能查找目標成員（優先檢查 Mention 與當前在語音房者）"""
     target_clean = target_name.strip().lstrip("@").lower()
 
-    # 1. 優先檢查 message.mentions（排除機器人本身）
-    for m in message.mentions:
-        if m.id != bot.user.id:
-            return m
-
-    # 2. 優先在語音房成員中查找
-    for vc in guild.voice_channels:
-        for m in vc.members:
+    # 1. 優先在 message.mentions 中精準尋找（排除機器人本身）
+    non_bot_mentions = [m for m in message.mentions if m.id != bot.user.id]
+    if len(non_bot_mentions) == 1:
+        # 如果只有 mention 一個人，那必定就是要操作的對象！
+        return non_bot_mentions[0]
+    elif len(non_bot_mentions) > 1:
+        for m in non_bot_mentions:
             if target_clean in m.display_name.lower() or target_clean in m.name.lower():
                 return m
+        return non_bot_mentions[0]
 
-    # 3. 在全伺服器成員中查找
+    # 2. 優先在當前語音房的成員中模糊比對
+    for vc in guild.voice_channels:
+        for m in vc.members:
+            if (target_clean in m.display_name.lower() or 
+                target_clean in m.name.lower() or 
+                m.display_name.lower() in target_clean or 
+                m.name.lower() in target_clean):
+                return m
+
+    # 3. 在全伺服器成員中比對
     for m in guild.members:
-        if target_clean in m.display_name.lower() or target_clean in m.name.lower():
+        if (target_clean in m.display_name.lower() or 
+            target_clean in m.name.lower() or 
+            m.display_name.lower() in target_clean or 
+            m.name.lower() in target_clean):
             return m
 
     return None
 
 
 async def process_voice_actions(reply_text: str, message: discord.Message) -> str:
-    """解析回覆中的 [[ACTION:...]] 標籤並執行 Discord 語音操作"""
     guild = message.guild
     if not guild:
-        # 私訊無語音房操作，直接清除標籤
         return re.sub(r"\[\[ACTION:.*?\]\]", "", reply_text).strip()
 
     action_pattern = re.compile(r"\[\[ACTION:([A-Z]+),\s*([^,\]]+)(?:,\s*([^\]]+))?\]\]", re.IGNORECASE)
     matches = action_pattern.findall(reply_text)
 
-    # 移除標籤供發送乾淨訊息
+    # 清除回覆中的標籤
     cleaned_reply = action_pattern.sub("", reply_text).strip()
 
     if not matches:
@@ -165,12 +177,16 @@ async def process_voice_actions(reply_text: str, message: discord.Message) -> st
         target_name = raw_target.strip()
         is_enable = (param.strip().lower() != "false") if param else True
 
+        logger.info(f"偵測到動作: {action_type}, 目標: {target_name}, 啟用: {is_enable}, 命令發起者: {message.author.display_name}")
+
         member = find_target_member(guild, target_name, message)
         if not member:
+            logger.warning(f"找不到目標成員: {target_name}")
             feedback_notes.append(f"（嘎嗷？本鯊在伺服器裡找不到「{target_name}」這個人捏！）")
             continue
 
         if not member.voice or not member.voice.channel:
+            logger.info(f"成員 {member.display_name} 不在語音房內")
             feedback_notes.append(f"（咬你喔 ( º言º )！{member.display_name} 根本不在語音房裡，本鯊咬不到他！）")
             continue
 
@@ -187,13 +203,12 @@ async def process_voice_actions(reply_text: str, message: discord.Message) -> st
                 await member.move_to(None)
                 logger.info(f"成功將 {member.display_name} 移出語音房")
         except discord.Forbidden:
-            logger.warning(f"操作失敗：權限不足，無法操作 {member.display_name}")
-            feedback_notes.append(f"（嗚哇！{member.display_name} 的身分組比本鯊還高，本鯊咬不動他嗷嗚……）")
+            logger.warning(f"Discord 403 Forbidden: 機器人身分組低於 {member.display_name}，無法操作！")
+            feedback_notes.append(f"（嗚哇！{member.display_name} 的身分組比本鯊的階級還高，Discord 擋住本鯊不給咬嗷嗚……請把本鯊的身分組拉高！）")
         except Exception as e:
             logger.error(f"語音操作發生異常: {e}", exc_info=True)
             feedback_notes.append(f"（本鯊剛才咬滑鼠滑倒了，操作失敗嘎嗷！）")
 
-    # 如果有因無法執行而產生的呆萌反饋，追加在訊息後方
     if feedback_notes:
         cleaned_reply = f"{cleaned_reply}\n\n" + "\n".join(feedback_notes)
 
@@ -248,7 +263,7 @@ else:
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
-intents.members = True  # 幫助準確比對伺服器成員名字
+intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -312,7 +327,6 @@ async def on_message(message: discord.Message):
 
     channel_id = message.channel.id
 
-    # 抓取即時伺服器動態情報
     server_info = get_server_context(message)
     prompt_payload = f"{cleaned_content}\n\n{server_info}"
 
@@ -321,16 +335,14 @@ async def on_message(message: discord.Message):
 
     async with message.channel.typing():
         try:
-            # 1. 呼叫 Gemini 產生對話與動作
+            logger.info(f"收到來自 [{message.author.display_name}] 的訊息: {cleaned_content}")
             raw_reply = await call_gemini_with_fallback(history_contents)
+            logger.info(f"模型原始回覆: {raw_reply}")
 
-            # 2. 解析並執行語音房動作（靜音/拒聽/踢人）
             final_reply = await process_voice_actions(raw_reply, message)
 
-            # 3. 寫入滑動視窗
             memory_manager.add_message(channel_id, role="model", text=final_reply)
 
-            # 4. 回覆 Discord 訊息
             if len(final_reply) > 1900:
                 chunks = [final_reply[i:i + 1900] for i in range(0, len(final_reply), 1900)]
                 for i, chunk in enumerate(chunks):
@@ -350,9 +362,6 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 
-# ---------------------------------------------------------------------------
-# 啟動進入點
-# ---------------------------------------------------------------------------
 def main():
     if not DISCORD_BOT_TOKEN or DISCORD_BOT_TOKEN.startswith("你的_"):
         print("[警告] DISCORD_BOT_TOKEN 尚未在 .env 檔案中配置！")
