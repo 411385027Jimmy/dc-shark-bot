@@ -1,0 +1,21 @@
+# Environment variables
+.env
+
+# Python cache & compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Logs
+*.log
+
+# IDE / Editor folders
+.vscode/
+.idea/
+
