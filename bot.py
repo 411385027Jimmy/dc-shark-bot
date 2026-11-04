@@ -44,7 +44,7 @@ ALLOWED_CHANNEL_ID = int(ALLOWED_CHANNEL_RAW) if ALLOWED_CHANNEL_RAW.isdigit() e
 CANDIDATE_MODELS = [DEFAULT_MODEL, "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 CANDIDATE_MODELS = list(dict.fromkeys(CANDIDATE_MODELS))
 
-# 全域插嘴冷卻紀錄（5 分鐘 = 300 秒）
+# 全域插嘴冷卻紀錄（1 分鐘 = 60 秒）
 last_interject_time: float = 0.0
 
 # ---------------------------------------------------------------------------
@@ -152,7 +152,7 @@ def is_biting_command(text: str) -> bool:
     return any(k in t for k in ["咬他", "咬她", "咬它", "咬人", "咬我", "去咬", "快咬", "咬一口", "咬死", "咬碎", "咬掉", "咬！", "咬"])
 
 
-def get_quick_roast_reply(text: str) -> Optional[str]:
+def get_quick_roast_reply(text: str, force_trigger: bool = False) -> Optional[str]:
     """命中特色關鍵字時，機率性直接觸發調侃吐槽回覆（零延遲、省 Token）"""
     if not text:
         return None
@@ -162,8 +162,8 @@ def get_quick_roast_reply(text: str) -> Optional[str]:
     if is_biting_command(t):
         return random.choice(BITING_RESPONSES)
 
-    # 2. 其他調侃關鍵字：約 70% 機率直接觸發快嘴吐槽，30% 機率放行給 Gemini 動態發揮
-    if random.random() > 0.70:
+    # 2. 其他調侃關鍵字機率檢查（若 force_trigger=True 則表示外層已通過機率過濾）
+    if not force_trigger and random.random() > 0.70:
         return None
 
     # 食材與海鮮威脅反殺
@@ -508,7 +508,7 @@ async def on_message(message: discord.Message):
             return
 
         # ===================================================================
-        # 分流 B：沒被 tag 時（智慧語意插嘴，全伺服器文字頻道皆可觸發）
+        # 分流 B：沒被 tag 時（智慧語意插嘴 / 偷聽調侃，全伺服器文字頻道皆可觸發）
         # ===================================================================
         else:
             if not message.guild:
@@ -518,20 +518,29 @@ async def on_message(message: discord.Message):
             if not content_text:
                 return
 
-            # 1. 嚴格冷卻機制：5 分鐘 (300 秒)
+            # 1. 嚴格冷卻機制：1 分鐘 (60 秒)
             global last_interject_time
             now = time.time()
-            if now - last_interject_time < 300.0:
+            if now - last_interject_time < 60.0:
                 return
 
-            # 2. 隨機機率：約 20%~30% 嘗試介入（此處設定 25%）
-            if random.random() > 0.25:
+            # 2. 隨機機率：30%~40% 嘗試介入（此處設定 35%）
+            if random.random() > 0.35:
+                return
+
+            # 3. 先行判定：是否觸發「特色關鍵字調侃吐槽」（海鮮、摸魚、智商、小魚乾、鯊魚、咬人）
+            quick_roast = get_quick_roast_reply(content_text, force_trigger=True)
+            if quick_roast:
+                last_interject_time = time.time()
+                logger.info(f"觸發偷聽關鍵字插嘴在頻道 #{message.channel.name}: {quick_roast}")
+                await message.channel.send(quick_roast)
+                await bot.process_commands(message)
                 return
 
             if not gemini_client:
                 return
 
-            # 3. 智慧語意判定
+            # 4. 若未命中特定關鍵字，則進行 Gemini 智慧語意判定
             try:
                 interject_contents = [
                     types.Content(
@@ -548,7 +557,7 @@ async def on_message(message: discord.Message):
                 if not cleaned_interject or "PASS" in cleaned_interject.upper():
                     return
 
-                # 判定值得插嘴：發送訊息並更新最後插嘴時間進入 5 分鐘冷卻
+                # 判定值得插嘴：發送訊息並更新最後插嘴時間進入 1 分鐘冷卻
                 last_interject_time = time.time()
                 logger.info(f"觸發智慧插嘴在頻道 #{message.channel.name}: {cleaned_interject}")
                 await message.channel.send(cleaned_interject)
