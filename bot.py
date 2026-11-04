@@ -261,6 +261,34 @@ def detect_fallback_action(content: str) -> Optional[Tuple[str, bool]]:
     return None
 
 
+def find_matching_members(target_str: str, members: List[discord.Member]) -> List[discord.Member]:
+    """根據字串在被 tag 的成員名單中精準比對目標"""
+    if not target_str:
+        return []
+    ts = target_str.strip().lower()
+    # 1. 檢查直接 Mention ID (<@123...>)
+    m_ids = re.findall(r"<@!?(\d+)>", target_str)
+    if m_ids:
+        matched = [m for m in members if str(m.id) in m_ids]
+        if matched:
+            return matched
+    # 2. 檢查純數字 ID
+    if ts.isdigit():
+        matched = [m for m in members if str(m.id) == ts]
+        if matched:
+            return matched
+    # 3. 檢查暱稱或使用者名稱
+    matched = []
+    for m in members:
+        dname = m.display_name.lower()
+        uname = m.name.lower()
+        if dname == ts or uname == ts:
+            return [m]
+        if ts in dname or ts in uname or dname in ts or uname in ts:
+            matched.append(m)
+    return matched
+
+
 async def process_voice_actions(reply_text: str, message: discord.Message, raw_prompt: str) -> str:
     guild = message.guild
     if not guild:
@@ -270,29 +298,44 @@ async def process_voice_actions(reply_text: str, message: discord.Message, raw_p
     matches = action_pattern.findall(reply_text)
     cleaned_reply = action_pattern.sub("", reply_text).strip()
 
-    target_mentions = [m for m in message.mentions if m.id != bot.user.id]
+    # 去除機器人自身，並依序去重被 @mention 的成員清單
+    target_mentions = list(dict.fromkeys([m for m in message.mentions if not (bot.user and m.id == bot.user.id)]))
 
     if not target_mentions:
         return cleaned_reply
 
+    # 解析動作清單：[(act_type, target_str, is_enable)]
     actions_to_execute = []
     if matches:
-        for act_type, _, param in matches:
+        for act_type, target_str, param in matches:
             act = act_type.strip().upper()
             is_enable = (param.strip().lower() != "false") if param else True
-            actions_to_execute.append((act, is_enable))
+            actions_to_execute.append((act, target_str.strip(), is_enable))
     else:
         fb = detect_fallback_action(raw_prompt)
         if fb:
-            actions_to_execute.append(fb)
+            act, is_enable = fb
+            actions_to_execute.append((act, "", is_enable))
 
     if not actions_to_execute:
         return cleaned_reply
 
     feedback_notes = []
+    # 核心防重複集合：記錄已執行的 (member.id, act)，確保每人在同一則訊息中絕對只執行一次
+    executed_pairs = set()
 
-    for act, is_enable in actions_to_execute:
-        for member in target_mentions:
+    for act, target_str, is_enable in actions_to_execute:
+        # 若指定了特定成員名稱，先精準匹配
+        candidates = find_matching_members(target_str, target_mentions)
+        # 若未指定或匹配不到特定對象（如通用關鍵字/fallback），則套用至全體被 tag 者
+        target_list = candidates if candidates else target_mentions
+
+        for member in target_list:
+            pair_key = (member.id, act)
+            if pair_key in executed_pairs:
+                continue
+            executed_pairs.add(pair_key)
+
             if not member.voice or not member.voice.channel:
                 feedback_notes.append(f"*(⚠️ 撲空了：{member.display_name} 目前不在語音房裡！)*")
                 continue
